@@ -7,7 +7,7 @@
 apiVersion: policies.kyverno.io/v1
 kind: MutatingPolicy
 metadata:
-  name: inject-proxy-env
+  name: gardener-extension-pods-inject-proxy-env
 spec:
   matchConstraints:
     resourceRules:
@@ -42,3 +42,98 @@ spec:
             })
           }
         } : Object{}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:mutate-gardener-operatingsystemconfigs:view
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: 'true'
+    rbac.kyverno.io/aggregate-to-reports-controller: 'true'
+rules:
+  - apiGroups:
+      - extensions.gardener.cloud
+    resources:
+      - operatingsystemconfigs
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:mutate-gardener-operatingsystemconfigs:update
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: 'true'
+rules:
+  - apiGroups:
+      - extensions.gardener.cloud
+    resources:
+      - operatingsystemconfigs
+    verbs:
+      - update
+---
+apiVersion: policies.kyverno.io/v1
+kind: MutatingPolicy
+metadata:
+  name: gardener-operatingsystemconfigs-inject-proxy-env
+spec:
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - "extensions.gardener.cloud"
+      apiVersions:
+      - "v1alpha1"
+      resources:
+      - "operatingsystemconfigs"
+      operations:
+      - "CREATE"
+      - "UPDATE"
+  mutations:
+{% if gardener_operator_proxy_env | d({}) | length > 0 %}
+  - patchType: JSONPatch
+    jsonPatch:
+      expression: |
+        (
+          !object.spec.units.exists(u, u.name == "containerd.service") ?
+            [
+              JSONPatch{
+                op: "add",
+                path: "/spec/units/-",
+                value: Object.spec.units{
+                  name: "containerd.service",
+                  dropIns: [Object.spec.units.dropIns{
+                      name: "http-proxy.conf",
+                      content: "[Service]\n{%- for key, value in gardener_operator_proxy_env.items() %}Environment=\"{{ key }}={{ value }}\"\n{%- endfor %}"
+                    }
+                  ]
+                }
+              }
+            ]
+          : []
+        )
+        + object.spec.units.map(u, u.name == "containerd.service" && u.dropIns == null ?
+          JSONPatch{
+            op: "add",
+            path: "/spec/units/" + string(object.spec.units.indexOf(u)) + "/dropIns",
+            value: [Object.spec.units.dropIns{
+                name: "http-proxy.conf",
+                content: "[Service]\n{%- for key, value in gardener_operator_proxy_env.items() %}Environment=\"{{ key }}={{ value }}\"\n{%- endfor %}"
+              }
+            ]
+          }
+        : null
+        ).filter(p, p != null)
+        + object.spec.units.map(u, u.name == "containerd.service" && u.dropIns != null && !u.dropIns.exists(d, d.name == "http-proxy.conf") ?
+          JSONPatch{
+            op: "add",
+            path: "/spec/units/" + string(object.spec.units.indexOf(u)) + "/dropIns/-",
+            value: Object.spec.units.dropIns{
+              name: "http-proxy.conf",
+              content: "[Service]\n{%- for key, value in gardener_operator_proxy_env.items() %}Environment=\"{{ key }}={{ value }}\"\n{%- endfor %}"
+            }
+          }
+        : null
+        ).filter(p, p != null)
+{% endif %}
